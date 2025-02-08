@@ -1,155 +1,51 @@
-import ssl
-import nltk
-from langchain_community.document_loaders import SeleniumURLLoader
-from langchain_openai import OpenAIEmbeddings
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_core.prompts import PromptTemplate
-from langchain_community.vectorstores import Chroma
+from haystack.document_stores import InMemoryDocumentStore
+from haystack.nodes import PreProcessor, EmbeddingRetriever
+from haystack.nodes import PromptNode
+from haystack.pipelines import Pipeline
 from dotenv import load_dotenv
 import os
-import certifi
-import requests
-from openai import OpenAI
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Set OpenAI API key
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+document_store = InMemoryDocumentStore(embedding_dim=1536)
 
-nltk.download('punkt', quiet=True)
-nltk.download('averaged_perceptron_tagger')
-
-template = """You are an exceptional customer support chatbot that gently answers questions.
-You know the following context information:
-
-{chunks_formatted}
-
-Answer the following question from a customer. Use only information from the previous
-context information. Do not invent stuff.
-
-Question: {query}
-
-Answer:
-"""
-
-prompt = PromptTemplate( 
-    input_variables=["chunks_formatted", "query"],
-    template=template
+preprocessor = PreProcessor(
+   clean_empty_lines=True,
+   clean_whitespace=True,
+   clean_header_footer=True,
+   split_by="word",
+   split_length=500,
+   split_overlap=50
 )
 
-def fix_ssl_certificates():
-    """Setup SSL certificates for Python on macOS"""
-    try:
-        ssl._create_default_https_context = ssl.create_default_context
-        ssl._create_default_https_context().load_verify_locations(certifi.where())
-        requests.get('https://www.nltk.org')
-        print("SSL certificate fix applied successfully")
-    except Exception as e:
-        print(f"Error setting up SSL certificates: {str(e)}")
+retriever = EmbeddingRetriever(
+   document_store=document_store,
+   embedding_model="text-embedding-3-small",
+   api_key=os.getenv("OPENAI_API_KEY")
+)
 
-def setup_nltk():
-    """Setup NLTK with automatic download of required data"""
-    try:
-        nltk.download('punkt', quiet=True)
-        print("Successfully downloaded NLTK data")
-    except Exception as e:
-        print(f"Error downloading NLTK data: {str(e)}")
-        raise
+prompt_node = PromptNode(
+   model_name_or_path="gpt-3.5-turbo",
+   api_key=os.getenv("OPENAI_API_KEY"),
+   default_prompt_template="Given the context: {context}, answer: {query}"
+)
 
-def load_and_process_urls(urls):
-    """Load and process URLs using Selenium with basic configuration"""
-    try:
-        print("Attempting to load documents...")
-        loader = SeleniumURLLoader(urls=urls, continue_on_failure=True)
-        docs_not_splitted = loader.load()
-        if not docs_not_splitted:
-            raise ValueError("No documents were successfully loaded")
-        print(f"Successfully loaded {len(docs_not_splitted)} documents")
-        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-        docs = text_splitter.split_documents(docs_not_splitted)
-        print(f"Split into {len(docs)} chunks")
-        return docs
-    except Exception as e:
-        print(f"Error in document loading: {str(e)}")
-        return None
+pipe = Pipeline()
+pipe.add_node(component=retriever, name="Retriever", inputs=["Query"])
+pipe.add_node(component=prompt_node, name="PromptNode", inputs=["Retriever"])
 
-def initialize_chroma(persist_directory="chroma_db"):
-    """Initialize ChromaDB with a local persistence directory"""
-    try:
-        # Create embeddings instance
-        embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
-        
-        # Initialize ChromaDB with persistence
-        db = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-        
-        print("ChromaDB initialized successfully")
-        return db
-    except Exception as e:
-        print(f"Error initializing ChromaDB: {str(e)}")
-        return None
+docs = [
+   {"content": "The solar system consists of eight planets.", "meta": {"source": "astronomy"}},
+   {"content": "Mars is known as the red planet.", "meta": {"source": "astronomy"}}
+]
 
-def main():
-    try:
-        fix_ssl_certificates()
-        setup_nltk()
-        load_dotenv()
+processed_docs = preprocessor.process(docs)
+document_store.delete_documents()
+document_store.write_documents(processed_docs)
+document_store.update_embeddings(retriever)
 
-        urls = ['https://beebom.com/what-is-nft-explained/',
-                'https://beebom.com/how-delete-spotify-account/',
-                'https://beebom.com/how-download-gif-twitter/',
-                'https://beebom.com/how-use-chatgpt-linux-terminal/',
-                'https://beebom.com/how-delete-spotify-account/',
-                'https://beebom.com/how-save-instagram-story-with-music/',
-                'https://beebom.com/how-install-pip-windows/',
-                'https://beebom.com/how-check-disk-usage-linux/']
-
-        print("Starting document processing...")
-        docs = load_and_process_urls(urls)
-        if not docs:
-            print("Failed to load documents. Exiting.")
-            return
-
-        # Setup ChromaDB
-        print("Initializing ChromaDB...")
-        embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
-        
-        # Initialize ChromaDB and add documents
-        db = Chroma.from_documents(
-            documents=docs,
-            embedding=embeddings,
-            persist_directory="chroma_db"
-        )
-        
-        print("Documents added to ChromaDB.")
-
-        print("\nTesting search functionality...")
-        query = "How to check disk usage in linux?"
-        results = db.similarity_search(query)
-        
-        # Format the retrieved chunks
-        retrieved_chunks = [doc.page_content for doc in results]
-        chunks_formatted = "\n\n".join(retrieved_chunks)
-        
-        # Create OpenAI client
-        client = OpenAI()
-        
-        # Generate answer using OpenAI
-        response = client.completions.create(
-            model="gpt-3.5-turbo-instruct",
-            prompt=prompt.format(
-                chunks_formatted=chunks_formatted,
-                query=query
-            ),
-            temperature=0,
-            max_tokens=500
-        )
-        
-        if response.choices:
-            print(response.choices[0].text.strip())
-
-    except Exception as e:
-        print(f"An error occurred in main: {str(e)}")
-
-if __name__ == "__main__":
-    main()
+results = pipe.run(
+   query="What is Mars known as?",
+   params={"Retriever": {"top_k": 1}}
+)
+print(results)
